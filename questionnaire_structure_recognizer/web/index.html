@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>问卷填写工具</title><link rel="stylesheet" href="/style.css?v=20260909-12"><link rel="stylesheet" href="/source-review.css">
+<script src="/source-review.js" defer></script>
+</head>
+<body>
+<header class="topbar"><div><h1>问卷填写工具</h1><p>结构识别 · 审核问答库 · 安全匹配 · Word 导出</p></div><div class="top-actions"><span id="saveState"></span><button id="language">EN</button></div></header>
+<div class="shell">
+  <nav id="nav"><button data-page="dashboard" class="active">工作台</button><button data-page="imports">导入历史资料</button><button data-page="new">填写新问卷</button><button data-page="questionnaires">问卷任务</button><button data-page="knowledge">问答库</button><button data-page="settings">设置</button></nav>
+  <main><p id="message"></p><div id="page"><div class="loading">正在读取…</div></div></main>
+</div>
+<dialog id="modal"><button class="close">×</button><div id="modalBody"></div></dialog>
+<script src="/app.js?v=20260909-12"></script>
+</body></html>

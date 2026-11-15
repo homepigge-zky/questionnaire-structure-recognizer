@@ -1,0 +1,1 @@
+-r questionnaire_structure_recognizer/requirements.txt

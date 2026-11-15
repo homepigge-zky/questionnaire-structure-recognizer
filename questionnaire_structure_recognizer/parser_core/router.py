@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+import zipfile
+import signal
+from contextlib import contextmanager
+from pathlib import Path
+from lxml import etree as ElementTree
+
+from .docx_parser import extract_docx
+from .pdf_parser import extract_pdf
+
+
+FORMATS = {".docx", ".pdf", ".doc"}
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+LO_PROFILE_VERSION = "isolated-bootstrap-v2-writer"
+
+
+def _libreoffice_executable() -> str | None:
+    """Resolve an explicitly configured, PATH, or bundled LibreOffice binary."""
+    configured = os.getenv("LIBREOFFICE_PATH")
+    if configured and Path(configured).is_file():
+        return configured
+    from_path = shutil.which("soffice")
+    if from_path:
+        return from_path
+    project_root = Path(__file__).resolve().parents[2]
+    candidates = (
+        project_root / ".tools" / "libreoffice" / "program" / "soffice.exe",
+        project_root / ".tools" / "libreoffice" / "program" / "soffice",
+    )
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
+def _run_lo(command: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """Bound the process tree we start, including Windows soffice.bin children."""
+    options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+               if os.name == "nt" else {"start_new_session": True})
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        if os.name == "nt":
+            try:
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            except (OSError, subprocess.TimeoutExpired):
+                process.kill()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+@contextmanager
+def _profile_bootstrap_lock(path: Path, timeout: float):
+    """Cross-process lock; unlike a directory lock it is released after a crash."""
+    with path.open("a+b") as handle:
+        handle.seek(0, 2)
+        if not handle.tell():
+            handle.write(b"0"); handle.flush()
+        started = time.monotonic()
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() - started >= timeout:
+                    raise RuntimeError("本地转换器仍在初始化，请稍后重试")
+                time.sleep(.2)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _secure_lo_profile(profile: Path):
+    """Preserve initialized application settings while enforcing document safety."""
+    user = profile / "user"; user.mkdir(parents=True, exist_ok=True)
+    registry = user / "registrymodifications.xcu"
+    oor = "http://openoffice.org/2001/registry"
+    ElementTree.register_namespace("oor", oor)
+    root = ElementTree.parse(registry).getroot() if registry.exists() else ElementTree.Element(f"{{{oor}}}items")
+    # xs:* appears inside attribute values as well as XML names. Keep these
+    # namespace declarations even when no expanded element name uses them.
+    namespaces = {**root.nsmap, "oor": oor, "xs": "http://www.w3.org/2001/XMLSchema",
+                  "xsi": "http://www.w3.org/2001/XMLSchema-instance"}
+    preserved = ElementTree.Element(root.tag, attrib=dict(root.attrib), nsmap=namespaces)
+    preserved.extend(list(root)); root = preserved
+    policies = {
+        "/org.openoffice.Office.Common/Security/Scripting": {"MacroSecurityLevel": "3", "DisableMacrosExecution": "true"},
+        "/org.openoffice.Office.Writer/Content/Update": {"Link": "2"},
+        "/org.openoffice.Office.Common/Misc": {"FirstRun": "false"},
+    }
+    for path, values in policies.items():
+        # These policy items are generated by this process, not trusted from a document.
+        for existing in list(root):
+            if existing.get(f"{{{oor}}}path") == path:
+                for prop in list(existing):
+                    if prop.get(f"{{{oor}}}name") in values:
+                        existing.remove(prop)
+        item = ElementTree.SubElement(root, "item", {f"{{{oor}}}path": path})
+        for name, value in values.items():
+            prop = ElementTree.SubElement(item, "prop", {f"{{{oor}}}name": name, f"{{{oor}}}op": "fuse"})
+            ElementTree.SubElement(prop, "value").text = value
+    ElementTree.ElementTree(root).write(registry, encoding="utf-8", xml_declaration=True)
+
+
+def prepare_lo_profile(executable: str, profile: Path) -> Path:
+    """Copy a document-free initialized profile; never share a running profile.
+
+    New Windows LO profiles register bundled extensions on first use (over a
+    minute on the tested deployment). The bootstrap opens only a program-created
+    blank document, never a customer file. Every conversion gets a private copy.
+    """
+    binary = Path(executable).resolve(); stat = binary.stat()
+    key = hashlib.sha256(f"{binary}|{stat.st_size}|{stat.st_mtime_ns}|{LO_PROFILE_VERSION}".encode()).hexdigest()[:24]
+    root = Path(os.getenv("QSR_CONVERTER_PROFILE_CACHE", str(Path(tempfile.gettempdir()) / "qsr-local-converter-profiles"))).resolve()
+    cache = root / key; cache.mkdir(parents=True, exist_ok=True)
+    manifest = cache / "ready.json"
+    timeout = int(os.getenv("QSR_CONVERTER_INIT_TIMEOUT", "180"))
+    with _profile_bootstrap_lock(cache / "initialize.lock", timeout + 20):
+        if manifest.is_file():
+            saved = json.loads(manifest.read_text(encoding="utf8"))
+            name = saved.get("profile", "")
+            if not name.startswith("base-") or Path(name).name != name:
+                raise RuntimeError("转换器初始化缓存无效，请检查本地配置")
+            base = cache / name
+            if not (base / "user/registrymodifications.xcu").is_file():
+                raise RuntimeError("转换器初始化缓存不完整，请重试初始化")
+        else:
+            base = cache / ("base-" + uuid.uuid4().hex)
+            _secure_lo_profile(base)
+            # --terminate_after_init exits before Writer/filter registration.
+            # Exercise the actual Writer pipeline using an empty local fixture.
+            from docx import Document
+            bootstrap_dir = cache / ("bootstrap-" + uuid.uuid4().hex)
+            bootstrap_dir.mkdir()
+            bootstrap_source = bootstrap_dir / "EMPTY_INITIALIZATION.docx"
+            blank = Document(); blank.add_paragraph(""); blank.save(bootstrap_source)
+            command = [str(binary), f"-env:UserInstallation={base.as_uri()}", "--headless", "--nologo",
+                       "--nodefault", "--norestore", "--convert-to", "pdf", "--outdir", str(bootstrap_dir), str(bootstrap_source)]
+            initialized_at = time.monotonic()
+            try:
+                result = _run_lo(command, timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("本地文档转换器首次初始化超时；任务可重试，原文件未修改") from exc
+            if result.returncode or not (bootstrap_dir / "EMPTY_INITIALIZATION.pdf").is_file():
+                raise RuntimeError("本地文档转换器初始化失败，请检查 LibreOffice 安装")
+            _secure_lo_profile(base)
+            manifest.write_text(json.dumps({"profile": base.name, "version": LO_PROFILE_VERSION,
+                "initialization_seconds": round(time.monotonic() - initialized_at, 3)}), encoding="utf8")
+        shutil.copytree(base, profile, ignore=shutil.ignore_patterns(".lock", "lock"))
+    _secure_lo_profile(profile)
+    return profile
+
+
+def _convert_doc(path: Path, directory: Path) -> Path:
+    directory = directory.resolve()
+    executable = _libreoffice_executable()
+    if not executable:
+        raise RuntimeError("旧版 DOC 需要本地 LibreOffice；请安装 LibreOffice 或配置 LIBREOFFICE_PATH")
+    # A fresh application profile must not force extension registration for
+    # every file. Its initialized base has never opened a customer document.
+    # LO's extension registry appends long backend paths. A profile nested
+    # below a document SHA cache exceeds Windows path limits and can hang,
+    # even when the input/output file paths themselves are valid.
+    with tempfile.TemporaryDirectory(prefix="qsr-lo-") as temporary:
+        profile = prepare_lo_profile(executable, Path(temporary) / "p")
+        return _convert_doc_with_profile(path, directory, executable, profile)
+
+
+def _convert_doc_with_profile(path: Path, directory: Path, executable: str, profile: Path) -> Path:
+    command = [
+        executable, f"-env:UserInstallation={profile.as_uri()}", "--headless", "--nologo",
+        "--nodefault", "--nolockcheck", "--norestore", "--convert-to", "docx",
+        "--outdir", str(directory), str(path),
+    ]
+    try:
+        result = _run_lo(command, int(os.getenv("QSR_CONVERT_TIMEOUT", "100")))
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("旧版 DOC 本地转换超时，已停止本次转换；请重试或检查文件完整性") from exc
+    converted = directory / (path.stem + ".docx")
+    if result.returncode or not converted.exists():
+        raise RuntimeError("LibreOffice 未能安全转换旧版 DOC")
+    return converted
+
+
+def _validate_docx(path: Path):
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            if "word/document.xml" not in names or "[Content_Types].xml" not in names:
+                raise ValueError("DOCX 缺少 Word 主文档结构")
+            if len(names) > 5000 or sum(x.file_size for x in archive.infolist()) > 100 * 1024 * 1024:
+                raise ValueError("DOCX 解包大小或内部文件数量超过限制")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("DOCX 容器损坏或扩展名错误") from exc
+
+
+def converted_doc_template(source: Path, cache: Path) -> Path:
+    """Persist the exact converted template used for all later location writes."""
+    checksum = hashlib.sha256(source.read_bytes()).hexdigest()
+    directory = cache.resolve() / checksum
+    directory.mkdir(parents=True, exist_ok=True)
+    target, manifest = directory / "source.docx", directory / "manifest.json"
+    if target.is_file() and manifest.is_file():
+        saved = json.loads(manifest.read_text(encoding="utf8"))
+        if saved.get("source_hash") == checksum and saved.get("template_hash") == hashlib.sha256(target.read_bytes()).hexdigest():
+            _validate_docx(target)
+            return target
+        raise ValueError("转换后的填写模板已变化，请重新识别后再导出")
+    # A fixed basename removes user filename and upload storage name from the
+    # conversion, and each hash has an isolated profile and working copy.
+    working = directory / "source.doc"
+    working.write_bytes(source.read_bytes())
+    target = _convert_doc(working, directory)
+    _validate_docx(target)
+    manifest.write_text(json.dumps({"source_hash": checksum,
+        "template_hash": hashlib.sha256(target.read_bytes()).hexdigest(),
+        "version": "doc-conversion-v2-isolated-macro-disabled"}), encoding="utf8")
+    return target
+
+
+def extract_document(path: str | Path, password: str = "", work_dir: str | Path | None = None, progress=None, ocr_enabled: bool | None = None):
+    source = Path(path).resolve()
+    suffix = source.suffix.lower()
+    if suffix not in FORMATS:
+        raise ValueError("当前仅支持 DOCX、DOC 和 PDF")
+    if not source.is_file():
+        raise ValueError("文件不存在")
+    max_bytes = int(os.getenv("QSR_MAX_UPLOAD_MB", "30")) * 1024 * 1024
+    if source.stat().st_size > max_bytes:
+        raise ValueError("文件超过识别器大小限制")
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    document_id = "doc-" + source_hash[:24]
+    magic = source.read_bytes()[:8]
+    if suffix == ".pdf":
+        if not magic.startswith(b"%PDF-"):
+            raise ValueError("PDF 扩展名与实际容器不一致")
+        return extract_pdf(source, source_hash, document_id, password, progress=progress, ocr_enabled=ocr_enabled)
+    if suffix == ".docx":
+        if not magic.startswith(b"PK"):
+            raise ValueError("DOCX 扩展名与实际容器不一致")
+        _validate_docx(source)
+        return extract_docx(source, source_hash, document_id)
+    if magic != OLE_MAGIC:
+        raise ValueError("DOC 必须是真实 OLE Word 文件，不能只修改扩展名")
+    if not work_dir:
+        with tempfile.TemporaryDirectory(prefix="qsr-doc-") as temp:
+            converted = converted_doc_template(source, Path(temp))
+            extracted = extract_docx(converted, source_hash, document_id)
+            extracted.metadata["converted_template_hash"] = hashlib.sha256(converted.read_bytes()).hexdigest()
+    else:
+        directory = Path(work_dir); directory.mkdir(parents=True, exist_ok=True)
+        converted = converted_doc_template(source, directory)
+        extracted = extract_docx(converted, source_hash, document_id)
+        extracted.metadata["converted_template_hash"] = hashlib.sha256(converted.read_bytes()).hexdigest()
+    extracted.filename = source.name
+    extracted.file_type = "DOC"
+    extracted.parser = "libreoffice_to_docx+native_ooxml"
+    extracted.warnings.insert(0, {"code": "converted_doc", "message": "旧版 DOC 已在本地安全转换；转换可能改变复杂版式，请核对来源结构。"})
+    extracted.extraction_status = "partial" if extracted.extraction_status == "complete" else extracted.extraction_status
+    return extracted

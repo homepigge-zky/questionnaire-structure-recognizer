@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "questionnaire-structure-v1",
+  "type": "object",
+  "required": ["schema_version", "document_id", "source_hash", "extraction_status", "sections", "source_blocks", "questions", "fill_position_inventory", "form_position_version", "non_qa_items", "unresolved_items", "warnings"],
+  "properties": {
+    "schema_version": {"const": "questionnaire-structure-v5-form-positions"},
+    "document_id": {"type": "string"},
+    "source_hash": {"type": "string"},
+    "extraction_status": {"enum": ["complete", "partial", "failed", "original_only"]},
+    "sections": {"type": "array"},
+    "source_blocks": {"type": "array"},
+    "questions": {"type": "array"},
+    "fill_position_inventory": {"type": "array"},
+    "form_position_version": {"type": "string"},
+    "non_qa_items": {"type": "array"},
+    "unresolved_items": {"type": "array"},
+    "warnings": {"type": "array"}
+  },
+  "additionalProperties": true
+}
